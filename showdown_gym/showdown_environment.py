@@ -105,7 +105,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 12
+        return 19
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -131,6 +131,21 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if len(health_opponent) < len(health_team):
             health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
 
+        # Whether can tera or not
+        can_tera = [1.0 if battle.can_tera else 0.0]
+        num_switches = [float(len(battle.available_switches))]
+        num_moves = [float(len(battle.available_moves))]
+
+        # --- move base powers (normalize by 200, pad to 4) ---
+        move_bps = []
+        for m in (battle.available_moves or []):
+            bp = m.base_power if m.base_power is not None else 0
+            move_bps.append(float(bp) / 200.0)  # crude normalization
+            if len(move_bps) == 4:
+                break
+        if len(move_bps) < 4:
+            move_bps += [0.0] * (4 - len(move_bps))
+
         #########################################################################################################
         # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
         #########################################################################################################
@@ -138,8 +153,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Final vector - single array with health of both teams
         final_vector = np.concatenate(
             [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
+                health_team,  # N components for the health of each pokemon - 6
+                health_opponent,  # N components for the health of opponent pokemon - 6
+                can_tera,  # 1 component for whether can tera or not - 1
+                num_switches,  # 1 component for number of switches available - 1
+                num_moves,  # 1 component for number of moves available - 1
+                move_bps,  # 4 components for the base power of each move - 4
             ]
         )
 
