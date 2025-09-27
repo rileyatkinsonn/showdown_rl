@@ -49,6 +49,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Calculates the reward based on the changes in state of the battle.
 
         You need to implement this method to define how the reward is calculated
+        reward =
+          + damage dealt to opponent
+          - 0.5 * damage taken
+          + 1.0 * (new opponent KOs)
+          - 1.0 * (our new KOs)
+          + 20.0 on win, -20.0 on loss
 
         Args:
             battle (AbstractBattle): The current battle instance containing information
@@ -87,8 +93,39 @@ class ShowdownEnvironment(BaseShowdownEnv):
             health_opponent
         )
 
-        # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
+        sum_diff_health_opponent = np.sum(diff_health_opponent)
+
+        # sum up the damage dealt to opponent
+        diff_health_team = np.array([mon.current_hp_fraction for mon in prior_battle.team.values()]) - np.array(health_team)
+        sum_diff_health_team = np.sum(diff_health_team)
+
+        # Caclulate whether any KOs have happened
+        num_ko_team = float(sum(1 for mon in battle.team.values() if mon.fainted is True))
+        prior_num_ko_team = float(sum(1 for mon in prior_battle.team.values() if mon.fainted is True))
+        diff_ko_team = prior_num_ko_team - num_ko_team
+
+        # caclulate whether any opponent KOs have happened
+        num_ko_opponent = float(sum(1 for mon in battle.opponent_team.values() if mon.fainted is True))
+        prior_num_ko_opponent = float(sum(1 for mon in prior_battle.opponent_team.values() if mon.fainted is True))
+        diff_ko_opponent = prior_num_ko_opponent - num_ko_opponent
+
+        # Reward Weightings
+        w_dealt = 1.0
+        w_taken = -0.5
+        w_ko_opponent = 1.0
+        w_ko_team = -1.0
+        w_win = 20.0
+        w_loss = -20.0
+
+      # Reward for reducing the opponent's health
+        reward += (w_dealt * sum_diff_health_opponent) # Reward for damage dealt to opponent
+        reward += (w_taken * sum_diff_health_team) # Penalty for damage taken
+        reward += (w_ko_opponent * diff_ko_opponent) # Reward for opponent KOs
+        reward += (w_ko_team * diff_ko_team) # Penalty for our KOs
+        if battle.won:
+            reward += w_win
+        elif battle.lost:
+            reward += w_loss
 
         return reward
 
@@ -105,7 +142,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 12
+        return 29
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -122,14 +159,45 @@ class ShowdownEnvironment(BaseShowdownEnv):
             np.float32: A 1D numpy array containing the state you want the agent to observe.
         """
 
+        active_pokemon = battle.active_pokemon
+        opp_active_pokemon = battle.opponent_active_pokemon
+        if active_pokemon is None or opp_active_pokemon is None:
+            raise ValueError("Active Pokémon not found in the battle.")
+
+
         health_team = [mon.current_hp_fraction for mon in battle.team.values()]
         health_opponent = [
             mon.current_hp_fraction for mon in battle.opponent_team.values()
         ]
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+        # Ensure both teams always have exactly 6 components
+        health_team.extend([0.0] * (6 - len(health_team)))
+        health_opponent.extend([1.0] * (6 - len(health_opponent)))
+
+        # Count of remaining Pokemon in each team
+        num_remaining_team = [float(sum(1 for mon in battle.team.values() if mon.fainted is False))]
+        num_remaining_opponent = [float(sum(1 for mon in battle.opponent_team.values() if mon.fainted is False))]
+
+        # Available moves of the active Pokemon
+        num_available_moves = [float(len(battle.available_moves))]
+
+        # Available moves of opponent's active Pokemon
+        available_moves_opponent = opp_active_pokemon.available_z_moves
+
+        #  Available switches
+        num_available_switches = [float(len(battle.available_switches))]
+
+        # can tera
+        can_tera = [1.0 if battle.can_tera else 0.0]
+
+        # one hot alive index
+        alive_team = [1.0 if mon and not mon.fainted else 0.0 for mon in battle.team.values()]
+        alive_opp = [1.0 if mon and not mon.fainted else 0.0 for mon in battle.opponent_team.values()]
+
+        # Ensure both alive arrays always have exactly 6 components
+        alive_team.extend([0.0] * (6 - len(alive_team)))
+        alive_opp.extend([0.0] * (6 - len(alive_opp)))
+
 
         #########################################################################################################
         # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
@@ -138,8 +206,16 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Final vector - single array with health of both teams
         final_vector = np.concatenate(
             [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
+                np.array(health_team, dtype=np.float32),  # N components for the health of each pokemon
+                np.array(health_opponent, dtype=np.float32),  # N components for the health of opponent pokemon
+                np.array(num_remaining_team, dtype=np.float32), # N components for number of remaining pokemon in team
+                np.array(num_remaining_opponent, dtype=np.float32), # N components for number of remaining pokemon in opponent team
+                np.array(num_available_switches, dtype=np.float32), # N components for number of available switches
+                np.array(num_available_moves, dtype=np.float32),  # N components for number of available moves
+                np.array(can_tera, dtype=np.float32),  # 1 component for whether the player can tera
+                np.array(alive_team, dtype=np.float32),  # one hot encoding for which pokemon are alive
+                np.array(alive_opp, dtype=np.float32),  # one hot encoding for which pokemon are alive
+
             ]
         )
 
