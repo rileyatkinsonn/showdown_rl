@@ -49,6 +49,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Calculates the reward based on the changes in state of the battle.
 
         You need to implement this method to define how the reward is calculated
+        reward =
+          + damage dealt to opponent
+          - 0.5 * damage taken
+          + 1.0 * (new opponent KOs)
+          - 1.0 * (our new KOs)
+          + 20.0 on win, -20.0 on loss
 
         Args:
             battle (AbstractBattle): The current battle instance containing information
@@ -87,8 +93,40 @@ class ShowdownEnvironment(BaseShowdownEnv):
             health_opponent
         )
 
+        sum_diff_health_opponent = np.sum(diff_health_opponent)
+
+        # sum up the damage dealt to opponent
+        diff_health_team = np.array([mon.current_hp_fraction for mon in prior_battle.team.values()]) - np.array(
+            health_team)
+        sum_diff_health_team = np.sum(diff_health_team)
+
+        # Caclulate whether any KOs have happened
+        num_ko_team = float(sum(1 for mon in battle.team.values() if mon.fainted is True))
+        prior_num_ko_team = float(sum(1 for mon in prior_battle.team.values() if mon.fainted is True))
+        diff_ko_team = prior_num_ko_team - num_ko_team
+
+        # caclulate whether any opponent KOs have happened
+        num_ko_opponent = float(sum(1 for mon in battle.opponent_team.values() if mon.fainted is True))
+        prior_num_ko_opponent = float(sum(1 for mon in prior_battle.opponent_team.values() if mon.fainted is True))
+        diff_ko_opponent = prior_num_ko_opponent - num_ko_opponent
+
+        # Reward Weightings
+        w_dealt = 1.0
+        w_taken = -0.5
+        w_ko_opponent = 1.0
+        w_ko_team = -1.0
+        w_win = 20.0
+        w_loss = -20.0
+
         # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
+        reward += (w_dealt * sum_diff_health_opponent)  # Reward for damage dealt to opponent
+        reward += (w_taken * sum_diff_health_team)  # Penalty for damage taken
+        reward += (w_ko_opponent * diff_ko_opponent)  # Reward for opponent KOs
+        reward += (w_ko_team * diff_ko_team)  # Penalty for our KOs
+        if battle.won:
+            reward += w_win
+        elif battle.lost:
+            reward += w_loss
 
         return reward
 
