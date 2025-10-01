@@ -17,6 +17,18 @@ from showdown_gym.base_environment import BaseShowdownEnv
 
 
 class ShowdownEnvironment(BaseShowdownEnv):
+    TYPES = [
+        "water", "normal", "grass", "flying", "psychic", "bug", "fire", "poison",
+        "dark", "fighting", "ground", "rock", "steel", "dragon", "electric",
+        "ghost", "fairy", "ice"
+    ]
+
+    @staticmethod
+    def _norm_type_name(t) -> str:
+        # Works for PokemonType enums and strings
+        return (getattr(t, "name", str(t))).lower()
+
+    TYPE_TO_INDEX = {t: i for i, t in enumerate(TYPES)}
 
     def __init__(
         self,
@@ -143,7 +155,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 19
+        return 55
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -169,6 +181,24 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if len(health_opponent) < len(health_team):
             health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
 
+        # My current pokemon type - one hot encoded
+        current_type = [0.0] * len(self.TYPES)
+        if battle.active_pokemon is not None:
+            for t in battle.active_pokemon.types:
+                tn = self._norm_type_name(t)
+                idx = self.TYPE_TO_INDEX.get(tn)
+                if idx is not None:
+                    current_type[idx] = 1.0
+
+        # Opponent current pokemon type - one hot encoded
+        opponent_current_type = [0.0] * len(self.TYPES)
+        if battle.opponent_active_pokemon is not None:
+            for t in battle.opponent_active_pokemon.types:
+                tn = self._norm_type_name(t)
+                idx = self.TYPE_TO_INDEX.get(tn)
+                if idx is not None:
+                    current_type[idx] = 1.0
+
         # Whether can tera or not
         can_tera = [1.0 if battle.can_tera else 0.0]
         num_switches = [float(len(battle.available_switches))]
@@ -193,6 +223,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
             [
                 health_team,  # N components for the health of each pokemon - 6
                 health_opponent,  # N components for the health of opponent pokemon - 6
+                current_type,  # 18 components for my current pokemon type - 18
+                opponent_current_type,  # 18 components for opponent current pokemon type - 18
                 can_tera,  # 1 component for whether can tera or not - 1
                 num_switches,  # 1 component for number of switches available - 1
                 num_moves,  # 1 component for number of moves available - 1
