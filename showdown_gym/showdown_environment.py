@@ -28,6 +28,23 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Works for PokemonType enums and strings
         return (getattr(t, "name", str(t))).lower()
 
+    def _move_meta_block(self, battle) -> list[float]:
+        stab, prio, cat = [], [], []
+        act = battle.active_pokemon
+        act_types = [self._norm_type_name(t) for t in (act.types if act and act.types else [])]
+        for m in (battle.available_moves or [])[:4]:
+            mt = self._norm_type_name(getattr(m, "type", "")) if getattr(m, "type", None) else ""
+            is_stab = 1.0 if mt and any(mt == t for t in act_types) else 0.0
+            stab.append(is_stab)
+            prio.append(1.0 if getattr(m, "priority", 0) > 0 else 0.0)
+            cat_raw = str(getattr(m, "category", "")).lower()
+            # physical=+1, special=-1, status=0
+            cat.append(1.0 if "physical" in cat_raw else (-1.0 if "special" in cat_raw else 0.0))
+        # pad to 4 moves
+        while len(stab) < 4:
+            stab.append(0.0); prio.append(0.0); cat.append(0.0)
+        return stab + prio + cat  # length 12
+
     TYPE_TO_INDEX = {t: i for i, t in enumerate(TYPES)}
 
     def __init__(
@@ -113,14 +130,14 @@ class ShowdownEnvironment(BaseShowdownEnv):
         sum_diff_health_team = np.sum(diff_health_team)
 
         # Caclulate whether any KOs have happened
-        num_ko_team = float(sum(1 for mon in battle.team.values() if mon.fainted is True))
-        prior_num_ko_team = float(sum(1 for mon in prior_battle.team.values() if mon.fainted is True))
-        diff_ko_team = prior_num_ko_team - num_ko_team
+        num_ko_team = float(sum(1 for m in battle.team.values() if m.fainted))
+        prior_num_ko_team = float(sum(1 for m in prior_battle.team.values() if m.fainted))
+        diff_ko_team = num_ko_team - prior_num_ko_team
 
         # caclulate whether any opponent KOs have happened
-        num_ko_opponent = float(sum(1 for mon in battle.opponent_team.values() if mon.fainted is True))
-        prior_num_ko_opponent = float(sum(1 for mon in prior_battle.opponent_team.values() if mon.fainted is True))
-        diff_ko_opponent = prior_num_ko_opponent - num_ko_opponent
+        num_ko_opponent = float(sum(1 for m in battle.opponent_team.values() if m.fainted))
+        prior_num_ko_opponent = float(sum(1 for m in prior_battle.opponent_team.values() if m.fainted))
+        diff_ko_opponent = num_ko_opponent - prior_num_ko_opponent
 
         # Reward Weightings
         w_dealt = 1.0
@@ -155,7 +172,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 55
+        return 67
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -197,7 +214,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 tn = self._norm_type_name(t)
                 idx = self.TYPE_TO_INDEX.get(tn)
                 if idx is not None:
-                    current_type[idx] = 1.0
+                    opponent_current_type[idx] = 1.0
 
         # Whether can tera or not
         can_tera = [1.0 if battle.can_tera else 0.0]
@@ -214,6 +231,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if len(move_bps) < 4:
             move_bps += [0.0] * (4 - len(move_bps))
 
+        move_meta = self._move_meta_block(battle)
+
         #########################################################################################################
         # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
         #########################################################################################################
@@ -229,6 +248,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 num_switches,  # 1 component for number of switches available - 1
                 num_moves,  # 1 component for number of moves available - 1
                 move_bps,  # 4 components for the base power of each move - 4
+                move_meta  # 12 components for move meta info - 12
             ]
         )
 
