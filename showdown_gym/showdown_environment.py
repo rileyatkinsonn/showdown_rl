@@ -29,20 +29,52 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return (getattr(t, "name", str(t))).lower()
 
     def _move_meta_block(self, battle) -> list[float]:
+        """
+        Returns [stab(4), priority>0(4), category(4: phys=+1, spec=-1, status=0)]
+        padded to 4 moves.
+        """
         stab, prio, cat = [], [], []
+
         act = battle.active_pokemon
         act_types = [self._norm_type_name(t) for t in (act.types if act and act.types else [])]
+
         for m in (battle.available_moves or [])[:4]:
-            mt = self._norm_type_name(getattr(m, "type", "")) if getattr(m, "type", None) else ""
-            is_stab = 1.0 if mt and any(mt == t for t in act_types) else 0.0
-            stab.append(is_stab)
-            prio.append(1.0 if getattr(m, "priority", 0) > 0 else 0.0)
-            cat_raw = str(getattr(m, "category", "")).lower()
-            # physical=+1, special=-1, status=0
-            cat.append(1.0 if "physical" in cat_raw else (-1.0 if "special" in cat_raw else 0.0))
+            # --- STAB flag ---
+            mt = ""
+            try:
+                mt = self._norm_type_name(getattr(m, "type", ""))
+            except Exception:
+                mt = ""
+            stab.append(1.0 if mt and mt in act_types else 0.0)
+
+            # --- Priority flag (safe) ---
+            p = 0
+            try:
+                p = int(m.priority)  # may KeyError
+            except Exception:
+                entry = getattr(m, "entry", {}) or {}
+                p = int(entry.get("priority", 0))
+            prio.append(1.0 if p > 0 else 0.0)
+
+            # --- Category encoding ---
+            cat_attr = getattr(m, "category", None)
+            if hasattr(cat_attr, "name"):
+                cname = cat_attr.name.lower()
+            else:
+                cname = str(cat_attr).lower()
+            if "physical" in cname:
+                cat.append(1.0)
+            elif "special" in cname:
+                cat.append(-1.0)
+            else:
+                cat.append(0.0)
+
         # pad to 4 moves
         while len(stab) < 4:
-            stab.append(0.0); prio.append(0.0); cat.append(0.0)
+            stab.append(0.0);
+            prio.append(0.0);
+            cat.append(0.0)
+
         return stab + prio + cat  # length 12
 
     TYPE_TO_INDEX = {t: i for i, t in enumerate(TYPES)}
@@ -250,7 +282,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 move_bps,  # 4 components for the base power of each move - 4
                 move_meta  # 12 components for move meta info - 12
             ]
-        )
+        ).astype(np.float32)
 
         return final_vector
 
