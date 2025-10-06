@@ -110,6 +110,18 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         return float(reward)
 
+    def _estimate_stat(self, mon, stat: str) -> float:
+        """Safe stat estimate even when info is unrevealed."""
+        if mon is None:
+            return 1.0
+        # base stat (fallback to 1 if missing)
+        base = (mon.base_stats.get(stat) if mon.base_stats else None) or 1
+        # apply boost stage like Showdown does (approx)
+        stage = mon.boosts.get(stat, 0) if mon.boosts else 0
+        boost = (2 + stage) / 2 if stage >= 0 else 2 / (2 - stage)
+        # rough level-100 stat approximation (consistent with your heuristic agent)
+        return ((2 * base + 31) + 5) * boost
+
     def _observation_size(self) -> int:
         """
         Returns the size of the observation size to create the observation space for all possible agents in the environment.
@@ -123,7 +135,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 41
+        return 46
 
     class PokemonType(Enum):
         NORMAL = 1.0
@@ -155,106 +167,90 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
-        Embeds the current state of a Pokémon battle into a numerical vector representation.
-        This method generates a feature vector that represents the current state of the battle,
-        this is used by the agent to make decisions.
-
-        You need to implement this method to define how the battle state is represented.
-
-        Args:
-            battle (AbstractBattle): The current battle instance containing information about
-                the player's team and the opponent's team.
-        Returns:
-            np.float32: A 1D numpy array containing the state you want the agent to observe.
+        Encodes the battle state into a feature vector inspired by SimpleHeuristicsPlayer.
+        This avoids raw type IDs and instead uses derived combat-relevant features.
         """
 
+        if battle.active_pokemon is None or battle.opponent_active_pokemon is None:
+            return np.zeros(self._observation_size(), dtype=np.float32)
+
+        max_team_size = 6
+        max_moves = 4
+
+        # --- Team state ---
         health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        health_opponent = [mon.current_hp_fraction for mon in battle.opponent_team.values()]
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+        # pad to 6
+        while len(health_team) < max_team_size:
+            health_team.append(0.0)
+        while len(health_opponent) < max_team_size:
+            health_opponent.append(1.0)  # unknown opp = assume full HP
 
-        # Fainted flags for my team (6 slots)
         fainted_team = [1.0 if mon.fainted else 0.0 for mon in battle.team.values()]
-
-        # Fainted flags for opponent team (6 slots)
         fainted_opponent = [1.0 if mon.fainted else 0.0 for mon in battle.opponent_team.values()]
-
-        # Pad so both are always length 6
-        while len(fainted_team) < 6:
-            fainted_team.append(0.0)  # empty slot = not fainted
-        while len(fainted_opponent) < 6:
+        while len(fainted_team) < max_team_size:
+            fainted_team.append(0.0)
+        while len(fainted_opponent) < max_team_size:
             fainted_opponent.append(0.0)
 
-        # Encode the active pokemon type (2 types, 0 if no type or ???)
-        active_poke_types = [
-            self._encode_type(battle.active_pokemon.type_1),
-            self._encode_type(battle.active_pokemon.type_2),
-        ]
+        # --- Active Pokémon matchup ---
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
 
-        opponent_active_poke_types = [
-            self._encode_type(battle.opponent_active_pokemon.type_1),
-            self._encode_type(battle.opponent_active_pokemon.type_2),
-        ]
+        matchup_score = 0.0
+        opp_matchup_score = 0.0
+        if active and opponent:
+            # my types vs their types
+            if opponent.types:
+                matchup_score = max(opponent.damage_multiplier(t) for t in active.types if t is not None)
+            # their types vs mine
+            if active.types:
+                opp_matchup_score = max(active.damage_multiplier(t) for t in opponent.types if t is not None)
 
-        # encode the move types of the active pokemon (4 moves, 0 if no move), negative if unusable
-        max_moves = 4
-        move_type_ids = [0.0] * max_moves  # 0 = no move
-        if battle.active_pokemon is not None:
-            for i, move in enumerate(list(battle.active_pokemon.moves.values())[:max_moves]):
-                if move.type is not None:
-                    type_id = self.PokemonType[move.type.name.upper()].value
-                    if move.current_pp > 0:
-                        move_type_ids[i] = type_id  # usable
-                    else:
-                        move_type_ids[i] = -type_id  # revealed but out of PP
+        # --- Encode moves (my 4 moves only, since opp moves are partial info) ---
+        move_features = []
+        if active:
+            atk_ratio = self._estimate_stat(battle.active_pokemon, "atk") / max(1.0, self._estimate_stat(
+                battle.opponent_active_pokemon, "def"))
+            spa_ratio = self._estimate_stat(battle.active_pokemon, "spa") / max(1.0, self._estimate_stat(
+                battle.opponent_active_pokemon, "spd"))
 
-        # encode the move types of opponent active pokemon (4 moves, 0 if no move)
-        opponent_move_type_ids = [0.0] * max_moves  # 0 = no move
-        if battle.opponent_active_pokemon is not None:
-            for i, move in enumerate(list(battle.opponent_active_pokemon.moves.values())[:max_moves]):
-                if move.type is not None:
-                    type_id = self.PokemonType[move.type.name.upper()].value
-                    # you usually won’t know opponent PP, but poke-env tracks if revealed
-                    if move.current_pp > 0:
-                        opponent_move_type_ids[i] = type_id  # revealed and still usable
-                    else:
-                        opponent_move_type_ids[i] = -type_id  # revealed but out of PP
+            for move in list(active.moves.values())[:max_moves]:
+                if move.type is None:
+                    move_features.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+                    continue
 
-        # Move effectiveness multipliers against opponent active pokemon (4 moves, 1.0 if no move)
-        move_effectiveness = [1.0] * max_moves  # 1.0
-        for i, move in enumerate(battle.available_moves[:max_moves]):
-            if move.type is not None and battle.opponent_active_pokemon is not None:
-                effectiveness = battle.opponent_active_pokemon.damage_multiplier(move.type)
-                move_effectiveness[i] = effectiveness
+                stab = 1.0 if move.type in active.types else 0.0
+                power = (move.base_power or 0) / 100.0
+                acc = move.accuracy if move.accuracy is not None else 1.0
+                ratio = atk_ratio if move.category.name == "PHYSICAL" else spa_ratio
 
-        can_tera = [1.0 if battle.can_tera else 0.0]
+                eff = 1.0
+                if opponent:
+                    eff = opponent.damage_multiplier(move.type)
 
+                usable = 1.0 if move.current_pp > 0 else -1.0
 
-        #########################################################################################################
-        # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
-        #########################################################################################################
+                move_features.extend([stab, power, acc, ratio, eff * usable])
 
-        # Final vector - single array with health of both teams
+        # pad if <4 moves
+        while len(move_features) < max_moves * 5:
+            move_features.extend([0.0] * 5)
+
+        # --- Final vector ---
         final_vector = np.concatenate(
             [
-                health_team,  # 6 components for the health of each pokemon
-                health_opponent,  # 6 components for the health of opponent pokemon
-                fainted_team,  # 6 components for the fainted flags of each pokemon
-                fainted_opponent,  # 6 components for the fainted flags of opponent pokemon
-                active_poke_types,  # 2 components for the active pokemon types
-                opponent_active_poke_types,  # 2 components for the opponent active pokemon types
-                move_type_ids,  # 4 components for the move types of the active pokemon
-                opponent_move_type_ids,  # 4 components for the move types of the opponent active pokemon
-                move_effectiveness,  # 4 components for the move effectiveness against opponent active pokemon
-                can_tera,  # 1 component for whether the active pokemon can tera
+                health_team,
+                health_opponent,
+                fainted_team,
+                fainted_opponent,
+                [matchup_score, opp_matchup_score],
+                move_features,
             ]
         )
 
-        return final_vector
+        return final_vector.astype(np.float32)
 
 
 ########################################
