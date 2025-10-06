@@ -1,5 +1,6 @@
 import os
 import time
+from enum import Enum
 from typing import Any, Dict
 
 import numpy as np
@@ -59,38 +60,55 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
 
         prior_battle = self._get_prior_battle(battle)
+        if prior_battle is None:
+            return 0.0  # no shaping on the very first observation
 
+        # --- Collect current HP fractions ---
+        hp_team_now = [m.current_hp_fraction for m in battle.team.values()]
+        hp_opp_now = [m.current_hp_fraction for m in battle.opponent_team.values()]
+
+        # Pad opponent to match team length (random battles can start with unknowns)
+        if len(hp_opp_now) < len(hp_team_now):
+            hp_opp_now += [1.0] * (len(hp_team_now) - len(hp_opp_now))
+
+        # --- Prior HP fractions ---
+        hp_team_prev = [m.current_hp_fraction for m in prior_battle.team.values()]
+        hp_opp_prev = [m.current_hp_fraction for m in prior_battle.opponent_team.values()]
+        if len(hp_opp_prev) < len(hp_team_prev):
+            hp_opp_prev += [1.0] * (len(hp_team_prev) - len(hp_opp_prev))
+
+        # --- Damage deltas (positive means we dealt damage / we took damage) ---
+        dmg_dealt = float(np.sum(np.array(hp_opp_prev) - np.array(hp_opp_now)))
+        dmg_taken = float(np.sum(np.array(hp_team_prev) - np.array(hp_team_now)))
+
+        # --- KO deltas (positive means a new KO happened since last step) ---
+        ko_team_now = sum(1 for m in battle.team.values() if m.fainted)
+        ko_team_prev = sum(1 for m in prior_battle.team.values() if m.fainted)
+        new_kos_against_us = float(ko_team_now - ko_team_prev)
+
+        ko_opp_now = sum(1 for m in battle.opponent_team.values() if m.fainted)
+        ko_opp_prev = sum(1 for m in prior_battle.opponent_team.values() if m.fainted)
+        new_kos_we_got = float(ko_opp_now - ko_opp_prev)
+
+        # --- Weights ---
+        w_hp = 1.0
+        w_ko = 2.0
+        win_bonus = 20.0
+        loss_bonus = -20.0
+
+        # --- Reward ---
         reward = 0.0
+        reward += w_hp * dmg_dealt  # good
+        reward -= w_hp * dmg_taken  # bad
+        reward += w_ko * new_kos_we_got  # good
+        reward -= w_ko * new_kos_against_us  # bad
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        if battle.won:
+            reward += win_bonus
+        elif battle.lost:
+            reward += loss_bonus
 
-        # If the opponent has less than 6 Pokémon, fill the missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
-
-        prior_health_opponent = []
-        if prior_battle is not None:
-            prior_health_opponent = [
-                mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
-            ]
-
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(prior_health_opponent) < len(health_team):
-            prior_health_opponent.extend(
-                [1.0] * (len(health_team) - len(prior_health_opponent))
-            )
-
-        diff_health_opponent = np.array(prior_health_opponent) - np.array(
-            health_opponent
-        )
-
-        # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
-
-        return reward
+        return float(reward)
 
     def _observation_size(self) -> int:
         """
@@ -105,7 +123,28 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 12
+        return 40
+
+    class PokemonType(Enum):
+        NORMAL = 1.0
+        FIRE = 2.0
+        WATER = 3.0
+        ELECTRIC = 4.0
+        GRASS = 5.0
+        ICE = 6.0
+        FIGHTING = 7.0
+        POISON = 8.0
+        GROUND = 9.0
+        FLYING = 10.0
+        PSYCHIC = 11.0
+        BUG = 12.0
+        ROCK = 13.0
+        GHOST = 14.0
+        DRAGON = 15.0
+        DARK = 16.0
+        STEEL = 17.0
+        FAIRY = 18.0
+
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -131,6 +170,65 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if len(health_opponent) < len(health_team):
             health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
 
+        # Fainted flags for my team (6 slots)
+        fainted_team = [1.0 if mon.fainted else 0.0 for mon in battle.team.values()]
+
+        # Fainted flags for opponent team (6 slots)
+        fainted_opponent = [1.0 if mon.fainted else 0.0 for mon in battle.opponent_team.values()]
+
+        # Pad so both are always length 6
+        while len(fainted_team) < 6:
+            fainted_team.append(0.0)  # empty slot = not fainted
+        while len(fainted_opponent) < 6:
+            fainted_opponent.append(0.0)
+
+
+        # Encode the active pokemon type (2 types, 0 if no type)
+        active_poke_types = [0.0, 0.0]
+        if battle.active_pokemon.type_1 is not None:
+            active_poke_types[0] = self.PokemonType[battle.active_pokemon.type_1.name.upper()].value
+        if battle.active_pokemon.type_2 is not None:
+            active_poke_types[1] = self.PokemonType[battle.active_pokemon.type_2.name.upper()].value
+
+        # opponent active pokemon type (2 types, 0 if no type)
+        opponent_active_poke_types = [0.0, 0.0]
+        if battle.opponent_active_pokemon.type_1 is not None:
+            opponent_active_poke_types[0] = self.PokemonType[battle.opponent_active_pokemon.type_1.name.upper()].value
+        if battle.opponent_active_pokemon.type_2 is not None:
+            opponent_active_poke_types[1] = self.PokemonType[battle.opponent_active_pokemon.type_2.name.upper()].value
+
+        # encode the move types of the active pokemon (4 moves, 0 if no move), negative if unusable
+        max_moves = 4
+        move_type_ids = [0.0] * max_moves  # 0 = no move
+        if battle.active_pokemon is not None:
+            for i, move in enumerate(list(battle.active_pokemon.moves.values())[:max_moves]):
+                if move.type is not None:
+                    type_id = self.PokemonType[move.type.name.upper()].value
+                    if move.current_pp > 0:
+                        move_type_ids[i] = type_id  # usable
+                    else:
+                        move_type_ids[i] = -type_id  # revealed but out of PP
+
+        # encode the move types of opponent active pokemon (4 moves, 0 if no move)
+        opponent_move_type_ids = [0.0] * max_moves  # 0 = no move
+        if battle.opponent_active_pokemon is not None:
+            for i, move in enumerate(list(battle.opponent_active_pokemon.moves.values())[:max_moves]):
+                if move.type is not None:
+                    type_id = self.PokemonType[move.type.name.upper()].value
+                    # you usually won’t know opponent PP, but poke-env tracks if revealed
+                    if move.current_pp > 0:
+                        opponent_move_type_ids[i] = type_id  # revealed and still usable
+                    else:
+                        opponent_move_type_ids[i] = -type_id  # revealed but out of PP
+
+        # Move effectiveness multipliers against opponent active pokemon (4 moves, 1.0 if no move)
+        move_effectiveness = [1.0] * max_moves  # 1.0
+        for i, move in enumerate(battle.available_moves[:max_moves]):
+            if move.type is not None and battle.opponent_active_pokemon is not None:
+                effectiveness = battle.opponent_active_pokemon.damage_multiplier(move.type)
+                move_effectiveness[i] = effectiveness
+
+
         #########################################################################################################
         # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
         #########################################################################################################
@@ -138,8 +236,15 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Final vector - single array with health of both teams
         final_vector = np.concatenate(
             [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
+                health_team,  # 6 components for the health of each pokemon
+                health_opponent,  # 6 components for the health of opponent pokemon
+                fainted_team,  # 6 components for the fainted flags of each pokemon
+                fainted_opponent,  # 6 components for the fainted flags of opponent pokemon
+                active_poke_types,  # 2 components for the active pokemon types
+                opponent_active_poke_types,  # 2 components for the opponent active pokemon types
+                move_type_ids,  # 4 components for the move types of the active pokemon
+                opponent_move_type_ids,  # 4 components for the move types of the opponent active pokemon
+                move_effectiveness,  # 4 components for the move effectiveness against opponent active pokemon
             ]
         )
 
