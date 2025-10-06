@@ -50,6 +50,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Calculates the reward based on the changes in state of the battle.
 
         You need to implement this method to define how the reward is calculated
+        reward =
+          + damage dealt to opponent
+          - 0.5 * damage taken
+          + 1.0 * (new opponent KOs)
+          - 1.0 * (our new KOs)
+          + 20.0 on win, -20.0 on loss
 
         Args:
             battle (AbstractBattle): The current battle instance containing information
@@ -60,55 +66,70 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
 
         prior_battle = self._get_prior_battle(battle)
-        if prior_battle is None:
-            return 0.0  # no shaping on the very first observation
 
-        # --- Collect current HP fractions ---
-        hp_team_now = [m.current_hp_fraction for m in battle.team.values()]
-        hp_opp_now = [m.current_hp_fraction for m in battle.opponent_team.values()]
-
-        # Pad opponent to match team length (random battles can start with unknowns)
-        if len(hp_opp_now) < len(hp_team_now):
-            hp_opp_now += [1.0] * (len(hp_team_now) - len(hp_opp_now))
-
-        # --- Prior HP fractions ---
-        hp_team_prev = [m.current_hp_fraction for m in prior_battle.team.values()]
-        hp_opp_prev = [m.current_hp_fraction for m in prior_battle.opponent_team.values()]
-        if len(hp_opp_prev) < len(hp_team_prev):
-            hp_opp_prev += [1.0] * (len(hp_team_prev) - len(hp_opp_prev))
-
-        # --- Damage deltas (positive means we dealt damage / we took damage) ---
-        dmg_dealt = float(np.sum(np.array(hp_opp_prev) - np.array(hp_opp_now)))
-        dmg_taken = float(np.sum(np.array(hp_team_prev) - np.array(hp_team_now)))
-
-        # --- KO deltas (positive means a new KO happened since last step) ---
-        ko_team_now = sum(1 for m in battle.team.values() if m.fainted)
-        ko_team_prev = sum(1 for m in prior_battle.team.values() if m.fainted)
-        new_kos_against_us = float(ko_team_now - ko_team_prev)
-
-        ko_opp_now = sum(1 for m in battle.opponent_team.values() if m.fainted)
-        ko_opp_prev = sum(1 for m in prior_battle.opponent_team.values() if m.fainted)
-        new_kos_we_got = float(ko_opp_now - ko_opp_prev)
-
-        # --- Weights ---
-        w_hp = 1.0
-        w_ko = 2.0
-        win_bonus = 20.0
-        loss_bonus = -20.0
-
-        # --- Reward ---
         reward = 0.0
-        reward += w_hp * dmg_dealt  # good
-        reward -= w_hp * dmg_taken  # bad
-        reward += w_ko * new_kos_we_got  # good
-        reward -= w_ko * new_kos_against_us  # bad
 
+        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
+        health_opponent = [
+            mon.current_hp_fraction for mon in battle.opponent_team.values()
+        ]
+
+        # If the opponent has less than 6 Pokémon, fill the missing values with 1.0 (fraction of health)
+        if len(health_opponent) < len(health_team):
+            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+
+        prior_health_opponent = []
+        if prior_battle is not None:
+            prior_health_opponent = [
+                mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
+            ]
+
+        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
+        if len(prior_health_opponent) < len(health_team):
+            prior_health_opponent.extend(
+                [1.0] * (len(health_team) - len(prior_health_opponent))
+            )
+
+        diff_health_opponent = np.array(prior_health_opponent) - np.array(
+            health_opponent
+        )
+
+        sum_diff_health_opponent = np.sum(diff_health_opponent)
+
+        # sum up the damage dealt to opponent
+        diff_health_team = np.array([mon.current_hp_fraction for mon in prior_battle.team.values()]) - np.array(
+            health_team)
+        sum_diff_health_team = np.sum(diff_health_team)
+
+        # Caclulate whether any KOs have happened
+        num_ko_team = float(sum(1 for m in battle.team.values() if m.fainted))
+        prior_num_ko_team = float(sum(1 for m in prior_battle.team.values() if m.fainted))
+        diff_ko_team = num_ko_team - prior_num_ko_team
+
+        # caclulate whether any opponent KOs have happened
+        num_ko_opponent = float(sum(1 for m in battle.opponent_team.values() if m.fainted))
+        prior_num_ko_opponent = float(sum(1 for m in prior_battle.opponent_team.values() if m.fainted))
+        diff_ko_opponent = num_ko_opponent - prior_num_ko_opponent
+
+        # Reward Weightings
+        w_dealt = 1.0
+        w_taken = -0.5
+        w_ko_opponent = 1.0
+        w_ko_team = -1.0
+        w_win = 20.0
+        w_loss = -20.0
+
+        # Reward for reducing the opponent's health
+        reward += (w_dealt * sum_diff_health_opponent)  # Reward for damage dealt to opponent
+        reward += (w_taken * sum_diff_health_team)  # Penalty for damage taken
+        reward += (w_ko_opponent * diff_ko_opponent)  # Reward for opponent KOs
+        reward += (w_ko_team * diff_ko_team)  # Penalty for our KOs
         if battle.won:
-            reward += win_bonus
+            reward += w_win
         elif battle.lost:
-            reward += loss_bonus
+            reward += w_loss
 
-        return float(reward)
+        return reward
 
     def _observation_size(self) -> int:
         """
