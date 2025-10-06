@@ -123,7 +123,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 40
+        return 41
 
     class PokemonType(Enum):
         NORMAL = 1.0
@@ -145,6 +145,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
         STEEL = 17.0
         FAIRY = 18.0
 
+    def _encode_type(self, poke_type) -> float:
+        if poke_type is None or poke_type.name == "???":
+            return 0.0
+        try:
+            return self.PokemonType[poke_type.name.upper()].value
+        except KeyError:
+            return 0.0
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -182,20 +189,16 @@ class ShowdownEnvironment(BaseShowdownEnv):
         while len(fainted_opponent) < 6:
             fainted_opponent.append(0.0)
 
+        # Encode the active pokemon type (2 types, 0 if no type or ???)
+        active_poke_types = [
+            self._encode_type(battle.active_pokemon.type_1),
+            self._encode_type(battle.active_pokemon.type_2),
+        ]
 
-        # Encode the active pokemon type (2 types, 0 if no type)
-        active_poke_types = [0.0, 0.0]
-        if battle.active_pokemon.type_1 is not None:
-            active_poke_types[0] = self.PokemonType[battle.active_pokemon.type_1.name.upper()].value
-        if battle.active_pokemon.type_2 is not None:
-            active_poke_types[1] = self.PokemonType[battle.active_pokemon.type_2.name.upper()].value
-
-        # opponent active pokemon type (2 types, 0 if no type)
-        opponent_active_poke_types = [0.0, 0.0]
-        if battle.opponent_active_pokemon.type_1 is not None:
-            opponent_active_poke_types[0] = self.PokemonType[battle.opponent_active_pokemon.type_1.name.upper()].value
-        if battle.opponent_active_pokemon.type_2 is not None:
-            opponent_active_poke_types[1] = self.PokemonType[battle.opponent_active_pokemon.type_2.name.upper()].value
+        opponent_active_poke_types = [
+            self._encode_type(battle.opponent_active_pokemon.type_1),
+            self._encode_type(battle.opponent_active_pokemon.type_2),
+        ]
 
         # encode the move types of the active pokemon (4 moves, 0 if no move), negative if unusable
         max_moves = 4
@@ -228,6 +231,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 effectiveness = battle.opponent_active_pokemon.damage_multiplier(move.type)
                 move_effectiveness[i] = effectiveness
 
+        can_tera = [1.0 if battle.can_tera else 0.0]
+
 
         #########################################################################################################
         # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
@@ -245,6 +250,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 move_type_ids,  # 4 components for the move types of the active pokemon
                 opponent_move_type_ids,  # 4 components for the move types of the opponent active pokemon
                 move_effectiveness,  # 4 components for the move effectiveness against opponent active pokemon
+                can_tera,  # 1 component for whether the active pokemon can tera
             ]
         )
 
