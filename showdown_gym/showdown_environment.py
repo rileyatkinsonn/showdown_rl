@@ -45,52 +45,53 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return info
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """
-        Calculates the reward based on the changes in state of the battle.
+        """Shaped reward: damage dealt/taken + KO deltas + terminal win/loss."""
+        prior = self._get_prior_battle(battle)
+        if prior is None:
+            return 0.0
 
-        You need to implement this method to define how the reward is calculated
+        def hp_vec(side_dict) -> list[float]:
+            v = [float(m.current_hp_fraction) for m in side_dict.values()]
+            # pad to 6 so newly revealed mons don't look like "healing"
+            while len(v) < 6:
+                v.append(1.0)
+            return v
 
-        Args:
-            battle (AbstractBattle): The current battle instance containing information
-                about the player's team and the opponent's team from the player's perspective.
-            prior_battle (AbstractBattle): The prior battle instance to compare against.
-        Returns:
-            float: The calculated reward based on the change in state of the battle.
-        """
+        # current and prior HP vectors
+        team_now = hp_vec(battle.team)
+        team_prev = hp_vec(prior.team)
+        opp_now = hp_vec(battle.opponent_team)
+        opp_prev = hp_vec(prior.opponent_team)
 
-        prior_battle = self._get_prior_battle(battle)
+        dmg_dealt = float(np.sum(np.array(opp_prev) - np.array(opp_now)))
+        dmg_taken = float(np.sum(np.array(team_prev) - np.array(team_now)))
+
+        def ko_count(side_dict) -> int:
+            return sum(1 for m in side_dict.values() if m.fainted)
+
+        new_kos_we_got = float(ko_count(battle.opponent_team) - ko_count(prior.opponent_team))
+        new_kos_against_us = float(ko_count(battle.team) - ko_count(prior.team))
+
+        # weights
+        w_dealt = 1.0
+        w_taken = 0.5
+        w_ko = 2.0
+        win_bonus = 20.0
+        loss_bonus = -20.0
 
         reward = 0.0
+        reward += w_dealt * dmg_dealt
+        reward -= w_taken * dmg_taken
+        reward += w_ko * new_kos_we_got
+        reward -= w_ko * new_kos_against_us
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        if battle.won:
+            reward += win_bonus
+        elif battle.lost:
+            reward += loss_bonus
 
-        # If the opponent has less than 6 Pokémon, fill the missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+        return float(reward)
 
-        prior_health_opponent = []
-        if prior_battle is not None:
-            prior_health_opponent = [
-                mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
-            ]
-
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(prior_health_opponent) < len(health_team):
-            prior_health_opponent.extend(
-                [1.0] * (len(health_team) - len(prior_health_opponent))
-            )
-
-        diff_health_opponent = np.array(prior_health_opponent) - np.array(
-            health_opponent
-        )
-
-        # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
-
-        return reward
 
     def _observation_size(self) -> int:
         """
@@ -105,45 +106,65 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 12
+        return 18
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        """
-        Embeds the current state of a Pokémon battle into a numerical vector representation.
-        This method generates a feature vector that represents the current state of the battle,
-        this is used by the agent to make decisions.
+        """18-D state:[eff_4, rel_4, pstab_4, force_switch, has_switch, my_hp, opp_hp, my_alive/6, opp_alive/6]"""
+        max_moves = 4
+        eff = [1.0] * max_moves       # neutral if unknown
+        rel = [1.0] * max_moves       # accuracy * expected_hits
+        pstab = [0.0] * max_moves     # (base_power * STAB) / 200
 
-        You need to implement this method to define how the battle state is represented.
+        active = battle.active_pokemon
+        opp = battle.opponent_active_pokemon
+        my_types = set(active.types) if active and active.types else set()
 
-        Args:
-            battle (AbstractBattle): The current battle instance containing information about
-                the player's team and the opponent's team.
-        Returns:
-            np.float32: A 1D numpy array containing the state you want the agent to observe.
-        """
+        for i, m in enumerate((battle.available_moves or [])[:max_moves]):
+            # effectiveness
+            if opp is not None:
+                try:
+                    e = float(opp.damage_multiplier(m))
+                except Exception:
+                    e = 1.0
+                eff[i] = float(min(max(e, 0.0), 4.0))
+            else:
+                eff[i] = 1.0
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+            # reliability = accuracy * expected_hits
+            acc = getattr(m, "accuracy", 1.0)
+            if acc is None:
+                acc = 1.0
+            acc = float(acc)
+            # some moves may store accuracy as 0-100; normalise defensively
+            if acc > 1.0:
+                acc /= 100.0
+            exp_hits = float(getattr(m, "expected_hits", 1.0) or 1.0)
+            rel[i] = float(min(max(acc * exp_hits, 0.0), 2.0))
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+            # power × STAB (normalised)
+            bp = float(getattr(m, "base_power", 0.0) or 0.0)
+            has_stab = 1.0
+            try:
+                has_stab = 1.5 if (getattr(m, "type", None) in my_types) else 1.0
+            except Exception:
+                has_stab = 1.0
+            pstab[i] = float(min(max((bp * has_stab) / 200.0, 0.0), 2.0))
 
-        #########################################################################################################
-        # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
-        #########################################################################################################
+        # context
+        force_switch = 1.0 if bool(getattr(battle, "force_switch", False)) else 0.0
+        has_switch = 1.0 if (len(battle.available_switches or [])) > 0 else 0.0
+        my_hp = float(getattr(active, "current_hp_fraction", 1.0) or 1.0)
+        opp_hp = float(getattr(opp, "current_hp_fraction", 1.0) or 1.0)
+        my_alive = sum(1 for m in battle.team.values() if not m.fainted) / 6.0
+        opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted) / 6.0
 
-        # Final vector - single array with health of both teams
-        final_vector = np.concatenate(
-            [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
-            ]
+        vec = np.array(
+            eff + rel + pstab
+            + [force_switch, has_switch, my_hp, opp_hp, my_alive, opp_alive],
+            dtype=np.float32,
         )
+        return vec
 
-        return final_vector
 
 
 ########################################
