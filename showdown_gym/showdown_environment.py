@@ -17,68 +17,6 @@ from showdown_gym.base_environment import BaseShowdownEnv
 
 
 class ShowdownEnvironment(BaseShowdownEnv):
-    TYPES = [
-        "water", "normal", "grass", "flying", "psychic", "bug", "fire", "poison",
-        "dark", "fighting", "ground", "rock", "steel", "dragon", "electric",
-        "ghost", "fairy", "ice"
-    ]
-
-    @staticmethod
-    def _norm_type_name(t) -> str:
-        # Works for PokemonType enums and strings
-        return (getattr(t, "name", str(t))).lower()
-
-    def _move_meta_block(self, battle) -> list[float]:
-        """
-        Returns [stab(4), priority>0(4), category(4: phys=+1, spec=-1, status=0)]
-        padded to 4 moves.
-        """
-        stab, prio, cat = [], [], []
-
-        act = battle.active_pokemon
-        act_types = [self._norm_type_name(t) for t in (act.types if act and act.types else [])]
-
-        for m in (battle.available_moves or [])[:4]:
-            # --- STAB flag ---
-            mt = ""
-            try:
-                mt = self._norm_type_name(getattr(m, "type", ""))
-            except Exception:
-                mt = ""
-            stab.append(1.0 if mt and mt in act_types else 0.0)
-
-            # --- Priority flag (safe) ---
-            p = 0
-            try:
-                p = int(m.priority)  # may KeyError
-            except Exception:
-                entry = getattr(m, "entry", {}) or {}
-                p = int(entry.get("priority", 0))
-            prio.append(1.0 if p > 0 else 0.0)
-
-            # --- Category encoding ---
-            cat_attr = getattr(m, "category", None)
-            if hasattr(cat_attr, "name"):
-                cname = cat_attr.name.lower()
-            else:
-                cname = str(cat_attr).lower()
-            if "physical" in cname:
-                cat.append(1.0)
-            elif "special" in cname:
-                cat.append(-1.0)
-            else:
-                cat.append(0.0)
-
-        # pad to 4 moves
-        while len(stab) < 4:
-            stab.append(0.0);
-            prio.append(0.0);
-            cat.append(0.0)
-
-        return stab + prio + cat  # length 12
-
-    TYPE_TO_INDEX = {t: i for i, t in enumerate(TYPES)}
-
     def __init__(
         self,
         battle_format: str = "gen9randombattle",
@@ -107,87 +45,52 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         """
-        Calculates the reward based on the changes in state of the battle.
-
-        You need to implement this method to define how the reward is calculated
-        reward =
-          + damage dealt to opponent
-          - 0.5 * damage taken
-          + 1.0 * (new opponent KOs)
-          - 1.0 * (our new KOs)
-          + 20.0 on win, -20.0 on loss
-
-        Args:
-            battle (AbstractBattle): The current battle instance containing information
-                about the player's team and the opponent's team from the player's perspective.
-            prior_battle (AbstractBattle): The prior battle instance to compare against.
-        Returns:
-            float: The calculated reward based on the change in state of the battle.
+        Sparse & simple imitation reward:
+          + If switched when heuristic recommends switch: +1.0; otherwise -1.0
+          + If stayed and used a move:
+               +1.0 if chosen move has max effectiveness vs opponent at decision time,
+               else - (best_eff - chosen_eff)  (clipped to [-1, 0])
+          + Win bonus +10, loss bonus -10
         """
-
         prior_battle = self._get_prior_battle(battle)
+        if prior_battle is None:
+            return 0.0
 
         reward = 0.0
+        # --- teacher switch decision evaluated at prior state
+        prior_switch_flag = self._switch_recommended_flag(prior_battle)
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        # --- did we switch?
+        switched = self._did_switch(prior_battle, battle)
 
-        # If the opponent has less than 6 Pokémon, fill the missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+        if switched:
+            # correct if teacher said switch
+            reward += 1.0 if prior_switch_flag >= 0.5 else -1.0
+        else:
+            # we stayed; see if we used the max-effectiveness move
+            opp_prev = getattr(prior_battle, "opponent_active_pokemon", None)
+            # build effectiveness for moves available at prior step
+            prior_moves = (getattr(prior_battle, "available_moves", None) or [])[:4]
+            if opp_prev is not None and prior_moves:
+                effs_prev = [self._safe_eff(opp_prev, m) for m in prior_moves]
+                best_eff = max(effs_prev) if effs_prev else 1.0
 
-        prior_health_opponent = []
-        if prior_battle is not None:
-            prior_health_opponent = [
-                mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
-            ]
+                chosen_move = self._moved_pp_drop(prior_battle, battle)
+                if chosen_move is not None:
+                    chosen_eff = self._safe_eff(opp_prev, chosen_move)
+                    if abs(chosen_eff - best_eff) < 1e-9:
+                        reward += 1.0
+                    else:
+                        # scale penalty to how suboptimal it was, capped at -1.0
+                        gap = max(0.0, best_eff - chosen_eff)
+                        reward -= min(1.0, gap)
+                # if we can't detect the chosen move, leave imitation at 0 for this step
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(prior_health_opponent) < len(health_team):
-            prior_health_opponent.extend(
-                [1.0] * (len(health_team) - len(prior_health_opponent))
-            )
-
-        diff_health_opponent = np.array(prior_health_opponent) - np.array(
-            health_opponent
-        )
-
-        sum_diff_health_opponent = np.sum(diff_health_opponent)
-
-        # sum up the damage dealt to opponent
-        diff_health_team = np.array([mon.current_hp_fraction for mon in prior_battle.team.values()]) - np.array(
-            health_team)
-        sum_diff_health_team = np.sum(diff_health_team)
-
-        # Caclulate whether any KOs have happened
-        num_ko_team = float(sum(1 for m in battle.team.values() if m.fainted))
-        prior_num_ko_team = float(sum(1 for m in prior_battle.team.values() if m.fainted))
-        diff_ko_team = num_ko_team - prior_num_ko_team
-
-        # caclulate whether any opponent KOs have happened
-        num_ko_opponent = float(sum(1 for m in battle.opponent_team.values() if m.fainted))
-        prior_num_ko_opponent = float(sum(1 for m in prior_battle.opponent_team.values() if m.fainted))
-        diff_ko_opponent = num_ko_opponent - prior_num_ko_opponent
-
-        # Reward Weightings
-        w_dealt = 1.0
-        w_taken = -0.5
-        w_ko_opponent = 1.0
-        w_ko_team = -1.0
-        w_win = 20.0
-        w_loss = -20.0
-
-        # Reward for reducing the opponent's health
-        reward += (w_dealt * sum_diff_health_opponent)  # Reward for damage dealt to opponent
-        reward += (w_taken * sum_diff_health_team)  # Penalty for damage taken
-        reward += (w_ko_opponent * diff_ko_opponent)  # Reward for opponent KOs
-        reward += (w_ko_team * diff_ko_team)  # Penalty for our KOs
+        # terminal shaping (small, simple)
         if battle.won:
-            reward += w_win
+            reward += 10.0
         elif battle.lost:
-            reward += w_loss
+            reward -= 10.0
 
         return reward
 
@@ -204,7 +107,103 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 67
+        return 5
+
+    # ---------- simple helpers (minimal + safe) ----------
+    def _safe_eff(self, opp, move) -> float:
+        """Return effectiveness multiplier vs opponent for 'move'.
+        Falls back to 1.0 if anything is missing."""
+        try:
+            if opp is None or move is None:
+                return 1.0
+            # poke-env supports opponent.damage_multiplier(move)
+            return float(opp.damage_multiplier(move))
+        except Exception:
+            # fallback via move.type if needed
+            try:
+                mtype = getattr(move, "type", None)
+                return float(opp.damage_multiplier(mtype)) if mtype is not None else 1.0
+            except Exception:
+                return 1.0
+
+    def _estimate_matchup_simple(self, mon, opp) -> float:
+        """Very light matchup score: 'how good my types are vs theirs' minus 'how good theirs are vs mine'.
+        Ignores speed/HP to keep state+reward minimal and deterministic."""
+        if mon is None or opp is None:
+            return 0.0
+        try:
+            # best we do to them
+            good = max([opp.damage_multiplier(t) for t in mon.types if t is not None] or [1.0])
+            # best they do to us
+            bad = max([mon.damage_multiplier(t) for t in opp.types if t is not None] or [1.0])
+            return float(good - bad)
+        except Exception:
+            return 0.0
+
+    def _switch_recommended_flag(self, battle) -> float:
+        """Return 1.0 if switching is clearly better than staying (by a small margin)."""
+        act = battle.active_pokemon
+        opp = battle.opponent_active_pokemon
+        if act is None or opp is None:
+            return 0.0
+        current = self._estimate_matchup_simple(act, opp)
+        best_switch = current
+        try:
+            for s in (battle.available_switches or []):
+                best_switch = max(best_switch, self._estimate_matchup_simple(s, opp))
+        except Exception:
+            pass
+        # margin keeps it simple but decisive
+        return 1.0 if (best_switch - current) > 0.5 else 0.0
+
+    def _move_effectiveness_vector(self, battle) -> list[float]:
+        """Up to 4 moves vs current opponent; 0.0 if slot empty."""
+        effs = [0.0, 0.0, 0.0, 0.0]
+        opp = getattr(battle, "opponent_active_pokemon", None)
+        moves = (getattr(battle, "available_moves", None) or [])[:4]
+        for i, m in enumerate(moves):
+            effs[i] = self._safe_eff(opp, m)
+        return effs
+
+    def _did_switch(self, prior_battle, battle) -> bool:
+        """Detect if we switched between prior and current."""
+        try:
+            a0 = getattr(prior_battle, "active_pokemon", None)
+            a1 = getattr(battle, "active_pokemon", None)
+            if a0 is None or a1 is None:
+                return False
+            # compare species (safer than object identity)
+            return str(a0.species) != str(a1.species)
+        except Exception:
+            return False
+
+    def _moved_pp_drop(self, prior_battle, battle):
+        """Return the move (object) we used by finding the move whose PP dropped; else None.
+        Only valid when we did NOT switch."""
+        try:
+            a0 = getattr(prior_battle, "active_pokemon", None)
+            a1 = getattr(battle, "active_pokemon", None)
+            if a0 is None or a1 is None:
+                return None
+            # ensure we didn't switch
+            if str(a0.species) != str(a1.species):
+                return None
+
+            prev_moves = (getattr(a0, "moves", {}) or {})
+            curr_moves = (getattr(a1, "moves", {}) or {})
+
+            # keys are move ids; use PP drop to detect selection
+            for mid, pm in prev_moves.items():
+                cm = curr_moves.get(mid)
+                if cm is None:
+                    continue
+                pp0 = getattr(pm, "current_pp", None)
+                pp1 = getattr(cm, "current_pp", None)
+                if pp0 is not None and pp1 is not None and pp1 < pp0:
+                    return cm  # or pm; id/type same
+        except Exception:
+            pass
+        return None
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -220,50 +219,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Returns:
             np.float32: A 1D numpy array containing the state you want the agent to observe.
         """
+        effs = self._move_effectiveness_vector(battle)  # len 4
+        switch_flag = [self._switch_recommended_flag(battle)]  # len 1
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
-
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
-
-        # My current pokemon type - one hot encoded
-        current_type = [0.0] * len(self.TYPES)
-        if battle.active_pokemon is not None:
-            for t in battle.active_pokemon.types:
-                tn = self._norm_type_name(t)
-                idx = self.TYPE_TO_INDEX.get(tn)
-                if idx is not None:
-                    current_type[idx] = 1.0
-
-        # Opponent current pokemon type - one hot encoded
-        opponent_current_type = [0.0] * len(self.TYPES)
-        if battle.opponent_active_pokemon is not None:
-            for t in battle.opponent_active_pokemon.types:
-                tn = self._norm_type_name(t)
-                idx = self.TYPE_TO_INDEX.get(tn)
-                if idx is not None:
-                    opponent_current_type[idx] = 1.0
-
-        # Whether can tera or not
-        can_tera = [1.0 if battle.can_tera else 0.0]
-        num_switches = [float(len(battle.available_switches))]
-        num_moves = [float(len(battle.available_moves))]
-
-        # --- move base powers (normalize by 200, pad to 4) ---
-        move_bps = []
-        for m in (battle.available_moves or []):
-            bp = m.base_power if m.base_power is not None else 0
-            move_bps.append(float(bp) / 200.0)  # crude normalization
-            if len(move_bps) == 4:
-                break
-        if len(move_bps) < 4:
-            move_bps += [0.0] * (4 - len(move_bps))
-
-        move_meta = self._move_meta_block(battle)
 
         #########################################################################################################
         # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
@@ -272,15 +230,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Final vector - single array with health of both teams
         final_vector = np.concatenate(
             [
-                health_team,  # N components for the health of each pokemon - 6
-                health_opponent,  # N components for the health of opponent pokemon - 6
-                current_type,  # 18 components for my current pokemon type - 18
-                opponent_current_type,  # 18 components for opponent current pokemon type - 18
-                can_tera,  # 1 component for whether can tera or not - 1
-                num_switches,  # 1 component for number of switches available - 1
-                num_moves,  # 1 component for number of moves available - 1
-                move_bps,  # 4 components for the base power of each move - 4
-                move_meta  # 12 components for move meta info - 12
+                effs,
+                switch_flag,
             ]
         ).astype(np.float32)
 
