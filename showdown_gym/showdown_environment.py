@@ -155,6 +155,7 @@ def _last_turn_opp_switched(prior: Optional[AbstractBattle], now: AbstractBattle
 
 
 class ShowdownEnvironment(BaseShowdownEnv):
+    WON_VALUE = 20.0  # terminal bonus
 
     def __init__(
         self,
@@ -169,6 +170,34 @@ class ShowdownEnvironment(BaseShowdownEnv):
             account_name_two=account_name_two,
             team=team,
         )
+        self._prev: dict[str, dict] = {}
+
+    def _get_tag(self, battle: AbstractBattle) -> str:
+        # poke-env exposes a unique tag per battle
+        return getattr(battle, "battle_tag", "default")
+
+    def _snapshot(self, battle: AbstractBattle) -> dict:
+        """Compact snapshot of what we need to compute deltas next step."""
+
+        def _fainted_count(side: dict) -> int:
+            return sum(1 for p in side.values() if p.fainted)
+
+        opp = battle.opponent_active_pokemon
+        opp_hp = float(opp.current_hp_fraction) if opp and opp.current_hp_fraction is not None else 1.0
+        opp_id = getattr(opp, "_id", None) or getattr(opp, "species", None) or "unknown"
+
+        return {
+            "our_fainted": _fainted_count(battle.team or {}),
+            "opp_fainted": _fainted_count(battle.opponent_team or {}),
+            "opp_hp": opp_hp,
+            "opp_active_id": str(opp_id),
+        }
+
+    def _get_prev(self, battle: AbstractBattle) -> dict | None:
+        return self._prev.get(self._get_tag(battle))
+
+    def _set_prev(self, battle: AbstractBattle) -> None:
+        self._prev[self._get_tag(battle)] = self._snapshot(battle)
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
@@ -183,96 +212,80 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return info
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """
-        Per-step reward with tiny, orthogonal nudges:
-          +12  KO they faint
-          -12  KO we faint
-          +1.5 speed advantage on our acting turn
-          +0.004 * (stab_power * eff * reliability) for chosen move quality
-          -1   overkill guard when a safer 2HKO exists
-          +3   applying useful status (burn/para/tox) when not in immediate kill window
-          -2   switch tax, unless forced or dodging lethal
-          +0.5 opponent takes residual damage end of turn
-          +3/-3 tera discipline (only up-when enabling a kill; down-when wasted)
-          ±won_value terminal
-        """
         r = 0.0
-
-        # ---- First-step guard when using diffs vs prior ----
-        # You can pass prior_battle from your env; if not available, treat as first step.
-
         us = battle.active_pokemon
         them = battle.opponent_active_pokemon
+        our_moves: List[Move] = list(battle.available_moves) if battle.available_moves else []
 
+        # Prior snapshot (None on very first step)
+        prev = self._get_prev(battle)
+        first_step = prev is None
+
+        # Current basics
         our_hp = _hp_frac(us)
         opp_hp = _hp_frac(them)
 
-        # --- KOs this step (diff in fainted counts if prior provided) ---
-        if not first_step and prior_battle is not None:
+        # ---------- KO swing via fainted count diffs ----------
+        if not first_step:
             def _fainted_count(side: dict) -> int:
                 return sum(1 for p in side.values() if p.fainted)
-            our_fainted_now = _fainted_count(battle.team or {})
-            our_fainted_prev = _fainted_count(prior_battle.team or {})
-            opp_fainted_now = _fainted_count(battle.opponent_team or {})
-            opp_fainted_prev = _fainted_count(prior_battle.opponent_team or {})
 
-            if opp_fainted_now > opp_fainted_prev:
+            our_fainted_now = _fainted_count(battle.team or {})
+            opp_fainted_now = _fainted_count(battle.opponent_team or {})
+            if opp_fainted_now > int(prev["opp_fainted"]):
                 r += 12.0
-            if our_fainted_now > our_fainted_prev:
+            if our_fainted_now > int(prev["our_fainted"]):
                 r -= 12.0
 
-        # --- Tempo (speed edge) ---
+        # ---------- Tempo ----------
         if _speed_advantage(us, them):
             r += 1.5
 
-        # --- Chosen move quality + overkill guard ---
-        if battle.available_moves:
-            # Heuristic: pick the actual move we sent if available, else proxy with argmax.
-            # (poke-env doesn't expose already-chosen move here reliably; this proxy is fine.)
-            chosen = max(battle.available_moves, key=lambda m: _stab_power(m, us) * _effectiveness(m, them) * _reliability(m))
+        # ---------- Chosen move quality + overkill guard ----------
+        if our_moves:
+            chosen = max(our_moves, key=lambda m: _stab_power(m, us) * _effectiveness(m, them) * _reliability(m))
             quality = 0.004 * _stab_power(chosen, us) * _effectiveness(chosen, them) * _reliability(chosen)
             r += float(quality)
 
             exp_dmg = _expected_damage_frac_const_scaled(chosen, us, them)
-            if exp_dmg > 1.5 * opp_hp and _safer_2hko_exists(battle.available_moves, us, them, opp_hp):
+            if exp_dmg > 1.5 * opp_hp and _safer_2hko_exists(our_moves, us, them, opp_hp):
                 r -= 1.0
 
-        # --- Useful status only when not in immediate kill window ---
+        # ---------- Useful status only when not in immediate kill window ----------
         if them is not None:
             inflicted = getattr(them, "status", None)
-            if _is_harmful_status(inflicted) and not _can_kill_now(list(battle.available_moves or []), us, them, opp_hp):
+            if _is_harmful_status(inflicted) and not _can_kill_now(our_moves, us, them, opp_hp):
                 r += 3.0
 
-        # --- Switch tax (contextual) ---
-        if getattr(battle, "switched_this_turn", False) or (battle.force_switch and not battle.available_moves):
-            # If we know we switched (your env can set a flag), punish unless forced or dodging lethal
+        # ---------- Switch tax (contextual) ----------
+        if getattr(battle, "switched_this_turn", False) or (battle.force_switch and not our_moves):
             forced = bool(battle.force_switch)
             dodging_lethal = _opp_can_kill_now_heuristic(us, them)
             if not forced and not dodging_lethal:
                 r -= 2.0
 
-        # --- Residual realized (poison/burn/sand/screen drop etc.) ---
-        # Can't detect all residuals reliably; as a lightweight proxy, reward if opp HP fraction strictly decreased while we didn't act (first step guard protects).
-        if not first_step and prior_battle is not None:
-            prev_opp = _hp_frac(getattr(prior_battle, "opponent_active_pokemon", None))
-            if opp_hp < prev_opp - 1e-6:
+        # ---------- Residual realized ----------
+        if not first_step:
+            prev_opp_hp = float(prev["opp_hp"])
+            if opp_hp < prev_opp_hp - 1e-6:
                 r += 0.5
 
-        # --- Tera discipline ---
+        # ---------- Tera discipline ----------
         used_tera = bool(getattr(battle, "was_tera_this_turn", False))
-        if used_tera:
-            if _can_kill_now(list(battle.available_moves or []), us, them, opp_hp) and _effectiveness(chosen, them) > 1.0:
+        if used_tera and our_moves:
+            # reuse chosen from above if available; else pick proxy again
+            chosen = max(our_moves, key=lambda m: _stab_power(m, us) * _effectiveness(m, them) * _reliability(m))
+            if _can_kill_now(our_moves, us, them, opp_hp) and _effectiveness(chosen, them) > 1.0:
                 r += 3.0
-            elif _effectiveness(chosen, them) <= 1.0 and not _can_kill_now(list(battle.available_moves or []), us, them, opp_hp):
+            elif _effectiveness(chosen, them) <= 1.0 and not _can_kill_now(our_moves, us, them, opp_hp):
                 r -= 3.0
 
-        # --- Terminal outcome ---
+        # ---------- Terminal ----------
         if battle.finished:
-            if battle.won:
-                r += float(won_value)
-            else:
-                r -= float(won_value)
+            r += self.WON_VALUE if battle.won else -self.WON_VALUE
 
+        # Update snapshot at END so next step can diff
+        self._set_prev(battle)
         return float(r)
 
     def _observation_size(self) -> int:
@@ -291,21 +304,17 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return 30
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        """
-        Returns a compact float32 vector:
-          - Per-move block (up to 4 moves): [eff, reliability, stab_power] * 4  => 12 dims
-          - Minimal existing 7-style context: [our_hp, opp_hp, alive_frac_us, alive_frac_them, force_switch, has_switch] => 6 dims
-          - New compact extras (12 dims):
-             [speed_advantage, priority_available, can_kill_now, opp_can_kill_now,
-              hazards_us, hazards_them, status_us, status_them,
-              opp_boosted_offense, opp_boosted_speed, tera_available, last_turn_opp_switched]
-        Total: 12 + 6 + 12 = 30 dims
-        """
         us = battle.active_pokemon
         them = battle.opponent_active_pokemon
         our_moves: List[Move] = list(battle.available_moves) if battle.available_moves else []
 
-        # Per-move features (pad to 4)
+        # ----- last-turn switch via local snapshot -----
+        prev = self._get_prev(battle)
+        prev_opp_id = (prev or {}).get("opp_active_id")
+        cur_opp_id = str(getattr(them, "_id", None) or getattr(them, "species", None) or "unknown")
+        last_opp_sw = 1.0 if (prev is not None and prev_opp_id != cur_opp_id) else 0.0
+
+        # Per-move block (pad to 4 * 3 = 12)
         per_move_feats: List[float] = []
         for m in our_moves[:4]:
             per_move_feats += [
@@ -313,14 +322,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 _reliability(m),
                 _stab_power(m, us),
             ]
-        # pad missing moves with zeros (3 features per slot)
         while len(per_move_feats) < 12:
             per_move_feats.append(0.0)
 
-        # Tiny original context (keep consistent scaling 0..1 where possible)
-        our_hp = _hp_frac(us)
-        opp_hp = _hp_frac(them)
-
+        # Base context (6)
         def _alive_frac(side: dict) -> float:
             if not side:
                 return 1.0
@@ -328,28 +333,26 @@ class ShowdownEnvironment(BaseShowdownEnv):
             alive = sum(1 for p in side.values() if not p.fainted)
             return float(alive / max(1, total))
 
+        our_hp = _hp_frac(us)
+        opp_hp = _hp_frac(them)
         alive_us = _alive_frac(battle.team or {})
         alive_them = _alive_frac(battle.opponent_team or {})
         force_switch = 1.0 if battle.force_switch else 0.0
         has_switch = 1.0 if battle.available_switches else 0.0
-
         base_context = [our_hp, opp_hp, alive_us, alive_them, force_switch, has_switch]
 
-        # New compact extras (booleans as 0/1 floats)
+        # Extras (12)
         speed_edge = 1.0 if _speed_advantage(us, them) else 0.0
         priority_avail = 1.0 if _priority_available(our_moves) else 0.0
         can_kill = 1.0 if _can_kill_now(our_moves, us, them, opp_hp) else 0.0
         opp_can_kill = 1.0 if _opp_can_kill_now_heuristic(us, them) else 0.0
-
         hazards_us = 1.0 if _side_has_hazards(battle.side_conditions or {}) else 0.0
         hazards_them = 1.0 if _side_has_hazards(battle.opponent_side_conditions or {}) else 0.0
         status_us = 1.0 if _is_harmful_status(getattr(us, "status", None)) else 0.0
         status_them = 1.0 if _is_harmful_status(getattr(them, "status", None)) else 0.0
-
         opp_boost_off = 1.0 if (them and ((them.boosts.get("atk", 0) or 0) > 0 or (them.boosts.get("spa", 0) or 0) > 0)) else 0.0
         opp_boost_spe = 1.0 if (them and (them.boosts.get("spe", 0) or 0) > 0) else 0.0
         tera_avail = 1.0 if getattr(battle, "can_tera", False) else 0.0
-        last_opp_sw = 1.0 if _last_turn_opp_switched(prior_battle, battle) else 0.0
 
         extras = [
             speed_edge, priority_avail, can_kill, opp_can_kill,
@@ -358,6 +361,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         ]
 
         vec = np.asarray(per_move_feats + base_context + extras, dtype=np.float32)
+
+        # Update snapshot at the END so next step can diff against this
+        self._set_prev(battle)
         return vec
 
 
