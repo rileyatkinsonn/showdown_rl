@@ -11,10 +11,79 @@ from poke_env import (
 )
 from poke_env.battle import AbstractBattle
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
-from poke_env.environment.singles_env import ObsType
 from poke_env.player.player import Player
+from poke_env.battle import Move, Pokemon
+from typing import List, Optional
 
 from showdown_gym.base_environment import BaseShowdownEnv
+
+
+def _stab_for(move: Move, mon: Optional[Pokemon]) -> float:
+    if mon is None or move.type is None or not mon.types:
+        return 1.0
+    return 1.5 if move.type in mon.types else 1.0
+
+def _eff_against(move: Move, target: Optional[Pokemon]) -> float:
+    if target is None or move.type is None:
+        return 1.0
+    try:
+        return float(target.damage_multiplier(move))
+    except Exception:
+        return 1.0
+
+def _rel(move: Move) -> float:
+    acc = float(move.accuracy) if move.accuracy is not None else 1.0
+    if acc > 1.0:  # guard in case accuracy is 0-100
+        acc /= 100.0
+    hits = float(move.expected_hits or 1.0)
+    return max(0.0, min(1.0, acc)) * max(1.0, hits)
+
+def _move_score(move: Move, us: Optional[Pokemon], them: Optional[Pokemon]) -> float:
+    bp = float(move.base_power or 0.0)
+    return bp * _stab_for(move, us) * _eff_against(move, them) * _rel(move)
+
+# a lightweight port of your SimpleHeuristics matchup score
+_SPEED_TIER_COEF = 0.1
+_HP_COEF = 0.4
+_SWITCH_MATCHUP_THRESH = -2.0
+
+def _estimate_matchup(mon: Pokemon, opp: Pokemon) -> float:
+    # type pressure (our best vs their types) - (their best vs our types)
+    our_vs_them = max([opp.damage_multiplier(t) for t in (mon.types or [])] or [1.0])
+    them_vs_our = max([mon.damage_multiplier(t) for t in (opp.types or [])] or [1.0])
+    score = float(our_vs_them - them_vs_our)
+    # speed tier
+    try:
+        if mon.base_stats["spe"] > opp.base_stats["spe"]:
+            score += _SPEED_TIER_COEF
+        elif opp.base_stats["spe"] > mon.base_stats["spe"]:
+            score -= _SPEED_TIER_COEF
+    except Exception:
+        pass
+    # hp fractions
+    score += float(mon.current_hp_fraction or 0.0) * _HP_COEF
+    score -= float(opp.current_hp_fraction or 0.0) * _HP_COEF
+    return score
+
+def _best_move_index(battle: AbstractBattle) -> Optional[int]:
+    moves: List[Move] = list(battle.available_moves or [])
+    if not moves:
+        return None
+    us, them = battle.active_pokemon, battle.opponent_active_pokemon
+    scores = [(_move_score(m, us, them), i) for i, m in enumerate(moves[:4])]
+    scores.sort(reverse=True)
+    return scores[0][1]
+
+def _best_switch_index(battle: AbstractBattle) -> Optional[int]:
+    switches = list(battle.available_switches or [])
+    if not switches:
+        return None
+    opp = battle.opponent_active_pokemon
+    if opp is None:
+        return 0
+    scored = [(_estimate_matchup(s, opp), i) for i, s in enumerate(switches[:6])]
+    scored.sort(reverse=True)
+    return scored[0][1]
 
 
 class ShowdownEnvironment(BaseShowdownEnv):
@@ -35,6 +104,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         self.rl_agent = account_name_one
 
+
+
     def _get_action_size(self) -> int | None:
         """
         None just uses the default number of actions as laid out in process_action - 26 actions.
@@ -43,7 +114,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         This should return the number of actions you wish to use if not using the default action scheme.
         """
-        return None  # Return None if action size is default
+        return 3  # Return None if action size is default
 
     def process_action(self, action: np.int64) -> np.int64:
         """
@@ -65,7 +136,67 @@ class ShowdownEnvironment(BaseShowdownEnv):
         :return: The battle order ID for the given action in context of the current battle.
         :rtype: np.Int64
         """
-        return action
+
+        def process_action(self, action: np.int64) -> np.int64:
+            """
+            Map {0,1,2} to global 26-action scheme:
+              0 -> best move (no Tera)   -> 6..9
+              1 -> best switch           -> 0..5
+              2 -> best move with Tera   -> 22..25 (falls back to best move if can't Tera)
+
+            Force-switch override: always execute best switch.
+            """
+            a = int(action)
+            battle: AbstractBattle = self.battle1  # BaseShowdownEnv stores the current battle
+            if battle is None:
+                return np.int64(-2)  # default (noop)
+
+            # If we MUST switch, ignore non-switch choices
+            if bool(getattr(battle, "force_switch", False)):
+                j = _best_switch_index(battle)
+                return np.int64(j if j is not None else -2)
+
+            # Gather basics
+            has_moves = bool(battle.available_moves)
+            has_switches = bool(battle.available_switches)
+
+            # Action 0: best move (no Tera)
+            if a == 0:
+                if has_moves:
+                    i = _best_move_index(battle)
+                    return np.int64(6 + (i or 0))
+                elif has_switches:
+                    j = _best_switch_index(battle)
+                    return np.int64(j if j is not None else -2)
+                return np.int64(-2)
+
+            # Action 1: best switch
+            if a == 1:
+                if has_switches:
+                    j = _best_switch_index(battle)
+                    return np.int64(j if j is not None else -2)
+                elif has_moves:
+                    i = _best_move_index(battle)
+                    return np.int64(6 + (i or 0))
+                return np.int64(-2)
+
+            # Action 2: best move WITH Tera (Gen9)
+            if a == 2:
+                can_tera = bool(getattr(battle, "can_tera", False))
+                if has_moves and can_tera:
+                    i = _best_move_index(battle)
+                    return np.int64(22 + (i or 0))  # 22..25: move+tera
+                # fallback: just use best move
+                if has_moves:
+                    i = _best_move_index(battle)
+                    return np.int64(6 + (i or 0))
+                if has_switches:
+                    j = _best_switch_index(battle)
+                    return np.int64(j if j is not None else -2)
+                return np.int64(-2)
+
+            # Unknown action -> default noop
+            return np.int64(-2)
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
@@ -80,52 +211,52 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return info
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """
-        Calculates the reward based on the changes in state of the battle.
+        """Shaped reward: damage dealt/taken + KO deltas + terminal win/loss."""
+        prior = self._get_prior_battle(battle)
+        if prior is None:
+            return 0.0
 
-        You need to implement this method to define how the reward is calculated
+        def hp_vec(side_dict) -> list[float]:
+            v = [float(m.current_hp_fraction) for m in side_dict.values()]
+            # pad to 6 so newly revealed mons don't look like "healing"
+            while len(v) < 6:
+                v.append(1.0)
+            return v
 
-        Args:
-            battle (AbstractBattle): The current battle instance containing information
-                about the player's team and the opponent's team from the player's perspective.
-            prior_battle (AbstractBattle): The prior battle instance to compare against.
-        Returns:
-            float: The calculated reward based on the change in state of the battle.
-        """
+        # current and prior HP vectors
+        team_now = hp_vec(battle.team)
+        team_prev = hp_vec(prior.team)
+        opp_now = hp_vec(battle.opponent_team)
+        opp_prev = hp_vec(prior.opponent_team)
 
-        prior_battle = self._get_prior_battle(battle)
+        dmg_dealt = float(np.sum(np.array(opp_prev) - np.array(opp_now)))
+        dmg_taken = float(np.sum(np.array(team_prev) - np.array(team_now)))
+
+        def ko_count(side_dict) -> int:
+            return sum(1 for m in side_dict.values() if m.fainted)
+
+        new_kos_we_got = float(ko_count(battle.opponent_team) - ko_count(prior.opponent_team))
+        new_kos_against_us = float(ko_count(battle.team) - ko_count(prior.team))
+
+        # weights
+        w_dealt = 1.0
+        w_taken = 0.5
+        w_ko = 2.0
+        win_bonus = 20.0
+        loss_bonus = -20.0
 
         reward = 0.0
+        reward += w_dealt * dmg_dealt
+        reward -= w_taken * dmg_taken
+        reward += w_ko * new_kos_we_got
+        reward -= w_ko * new_kos_against_us
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        if battle.won:
+            reward += win_bonus
+        elif battle.lost:
+            reward += loss_bonus
 
-        # If the opponent has less than 6 Pokémon, fill the missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
-
-        prior_health_opponent = []
-        if prior_battle is not None:
-            prior_health_opponent = [
-                mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
-            ]
-
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(prior_health_opponent) < len(health_team):
-            prior_health_opponent.extend(
-                [1.0] * (len(health_team) - len(prior_health_opponent))
-            )
-
-        diff_health_opponent = np.array(prior_health_opponent) - np.array(
-            health_opponent
-        )
-
-        # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
-
-        return reward
+        return float(reward)
 
     def _observation_size(self) -> int:
         """
@@ -140,45 +271,64 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 12
+        return 18
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        """
-        Embeds the current state of a Pokémon battle into a numerical vector representation.
-        This method generates a feature vector that represents the current state of the battle,
-        this is used by the agent to make decisions.
+        """18-D state:[eff_4, rel_4, pstab_4, force_switch, has_switch, my_hp, opp_hp, my_alive/6, opp_alive/6]"""
+        max_moves = 4
+        eff = [1.0] * max_moves       # neutral if unknown
+        rel = [1.0] * max_moves       # accuracy * expected_hits
+        pstab = [0.0] * max_moves     # (base_power * STAB) / 200
 
-        You need to implement this method to define how the battle state is represented.
+        active = battle.active_pokemon
+        opp = battle.opponent_active_pokemon
+        my_types = set(active.types) if active and active.types else set()
 
-        Args:
-            battle (AbstractBattle): The current battle instance containing information about
-                the player's team and the opponent's team.
-        Returns:
-            np.float32: A 1D numpy array containing the state you want the agent to observe.
-        """
+        for i, m in enumerate((battle.available_moves or [])[:max_moves]):
+            # effectiveness
+            if opp is not None:
+                try:
+                    e = float(opp.damage_multiplier(m))
+                except Exception:
+                    e = 1.0
+                eff[i] = float(min(max(e, 0.0), 4.0))
+            else:
+                eff[i] = 1.0
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+            # reliability = accuracy * expected_hits
+            acc = getattr(m, "accuracy", 1.0)
+            if acc is None:
+                acc = 1.0
+            acc = float(acc)
+            # some moves may store accuracy as 0-100; normalise defensively
+            if acc > 1.0:
+                acc /= 100.0
+            exp_hits = float(getattr(m, "expected_hits", 1.0) or 1.0)
+            rel[i] = float(min(max(acc * exp_hits, 0.0), 2.0))
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+            # power × STAB (normalised)
+            bp = float(getattr(m, "base_power", 0.0) or 0.0)
+            has_stab = 1.0
+            try:
+                has_stab = 1.5 if (getattr(m, "type", None) in my_types) else 1.0
+            except Exception:
+                has_stab = 1.0
+            pstab[i] = float(min(max((bp * has_stab) / 200.0, 0.0), 2.0))
 
-        #########################################################################################################
-        # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
-        #########################################################################################################
+        # context
+        force_switch = 1.0 if bool(getattr(battle, "force_switch", False)) else 0.0
+        has_switch = 1.0 if (len(battle.available_switches or [])) > 0 else 0.0
+        my_hp = float(getattr(active, "current_hp_fraction", 1.0) or 1.0)
+        opp_hp = float(getattr(opp, "current_hp_fraction", 1.0) or 1.0)
+        my_alive = sum(1 for m in battle.team.values() if not m.fainted) / 6.0
+        opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted) / 6.0
 
-        # Final vector - single array with health of both teams
-        final_vector = np.concatenate(
-            [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
-            ]
+        vec = np.array(
+            eff + rel + pstab
+            + [force_switch, has_switch, my_hp, opp_hp, my_alive, opp_alive],
+            dtype=np.float32,
         )
-
-        return final_vector
+        return vec
 
 
 ########################################
