@@ -114,7 +114,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         This should return the number of actions you wish to use if not using the default action scheme.
         """
-        return 3  # Return None if action size is default
+        return 10  # Return None if action size is default
 
     def process_action(self, action: np.int64) -> np.int64:
         """
@@ -137,66 +137,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         :rtype: np.Int64
         """
 
-        def process_action(self, action: np.int64) -> np.int64:
-            """
-            Map {0,1,2} to global 26-action scheme:
-              0 -> best move (no Tera)   -> 6..9
-              1 -> best switch           -> 0..5
-              2 -> best move with Tera   -> 22..25 (falls back to best move if can't Tera)
+        return action  # Return action directly if using default action scheme
 
-            Force-switch override: always execute best switch.
-            """
-            a = int(action)
-            battle: AbstractBattle = self.battle1  # BaseShowdownEnv stores the current battle
-            if battle is None:
-                return np.int64(-2)  # default (noop)
-
-            # If we MUST switch, ignore non-switch choices
-            if bool(getattr(battle, "force_switch", False)):
-                j = _best_switch_index(battle)
-                return np.int64(j if j is not None else -2)
-
-            # Gather basics
-            has_moves = bool(battle.available_moves)
-            has_switches = bool(battle.available_switches)
-
-            # Action 0: best move (no Tera)
-            if a == 0:
-                if has_moves:
-                    i = _best_move_index(battle)
-                    return np.int64(6 + (i or 0))
-                elif has_switches:
-                    j = _best_switch_index(battle)
-                    return np.int64(j if j is not None else -2)
-                return np.int64(-2)
-
-            # Action 1: best switch
-            if a == 1:
-                if has_switches:
-                    j = _best_switch_index(battle)
-                    return np.int64(j if j is not None else -2)
-                elif has_moves:
-                    i = _best_move_index(battle)
-                    return np.int64(6 + (i or 0))
-                return np.int64(-2)
-
-            # Action 2: best move WITH Tera (Gen9)
-            if a == 2:
-                can_tera = bool(getattr(battle, "can_tera", False))
-                if has_moves and can_tera:
-                    i = _best_move_index(battle)
-                    return np.int64(22 + (i or 0))  # 22..25: move+tera
-                # fallback: just use best move
-                if has_moves:
-                    i = _best_move_index(battle)
-                    return np.int64(6 + (i or 0))
-                if has_switches:
-                    j = _best_switch_index(battle)
-                    return np.int64(j if j is not None else -2)
-                return np.int64(-2)
-
-            # Unknown action -> default noop
-            return np.int64(-2)
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
