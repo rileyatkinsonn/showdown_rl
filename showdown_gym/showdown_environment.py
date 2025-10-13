@@ -15,15 +15,19 @@ from poke_env.battle import (
     Move,
 )
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
-from poke_env.environment.singles_env import ObsType
 from poke_env.player.player import Player
 
 from showdown_gym.base_environment import BaseShowdownEnv
 
+
+# ----------------------------
+# Heuristic helpers
+# ----------------------------
 def _stab_for(move: Move, mon: Optional[Pokemon]) -> float:
     if mon is None or move.type is None or not mon.types:
         return 1.0
     return 1.5 if move.type in mon.types else 1.0
+
 
 def _eff_against(move: Move, target: Optional[Pokemon]) -> float:
     if target is None or move.type is None:
@@ -33,6 +37,7 @@ def _eff_against(move: Move, target: Optional[Pokemon]) -> float:
     except Exception:
         return 1.0
 
+
 def _rel(move: Move) -> float:
     acc = float(move.accuracy) if move.accuracy is not None else 1.0
     if acc > 1.0:  # guard if 0..100
@@ -40,12 +45,15 @@ def _rel(move: Move) -> float:
     hits = float(move.expected_hits or 1.0)
     return max(0.0, min(1.0, acc)) * max(1.0, hits)
 
+
 def _move_score(move: Move, us: Optional[Pokemon], them: Optional[Pokemon]) -> float:
     bp = float(move.base_power or 0.0)
     return bp * _stab_for(move, us) * _eff_against(move, them) * _rel(move)
 
+
 _SPEED_TIER_COEF = 0.1
 _HP_COEF = 0.4
+
 
 def _estimate_matchup(mon: Pokemon, opp: Pokemon) -> float:
     our_vs_them = max([opp.damage_multiplier(t) for t in (mon.types or [])] or [1.0])
@@ -62,6 +70,7 @@ def _estimate_matchup(mon: Pokemon, opp: Pokemon) -> float:
     score -= float(opp.current_hp_fraction or 0.0) * _HP_COEF
     return score
 
+
 def _best_move_idx(b: AbstractBattle) -> Optional[int]:
     moves: List[Move] = list(b.available_moves or [])
     if not moves:
@@ -69,6 +78,7 @@ def _best_move_idx(b: AbstractBattle) -> Optional[int]:
     us, them = b.active_pokemon, b.opponent_active_pokemon
     k = min(4, len(moves))
     return max(range(k), key=lambda i: _move_score(moves[i], us, them))
+
 
 def _best_switch_idx(b: AbstractBattle) -> Optional[int]:
     switches = list(b.available_switches or [])
@@ -79,10 +89,12 @@ def _best_switch_idx(b: AbstractBattle) -> Optional[int]:
         return 0
     return max(range(len(switches)), key=lambda i: _estimate_matchup(switches[i], opp))
 
+
 def _hp_frac(mon: Optional[Pokemon]) -> float:
     if mon is None or mon.current_hp_fraction is None:
         return 1.0
     return float(mon.current_hp_fraction)
+
 
 def _speed_advantage(us: Optional[Pokemon], them: Optional[Pokemon]) -> bool:
     if us is None or them is None:
@@ -91,6 +103,7 @@ def _speed_advantage(us: Optional[Pokemon], them: Optional[Pokemon]) -> bool:
         return (us.stats.get("spe", 0) or 0) > (them.stats.get("spe", 0) or 0)
     except Exception:
         return (us.base_stats.get("spe", 0) or 0) > (them.base_stats.get("spe", 0) or 0)
+
 
 def _can_kill_now(b: AbstractBattle, i_best: Optional[int]) -> bool:
     if i_best is None or not b.available_moves:
@@ -102,6 +115,7 @@ def _can_kill_now(b: AbstractBattle, i_best: Optional[int]) -> bool:
     exp_frac = k * _move_score(m, us, them)
     return them is not None and exp_frac >= _hp_frac(them) - 1e-6
 
+
 def _opp_can_kill_now_heuristic(b: AbstractBattle) -> bool:
     us, them = b.active_pokemon, b.opponent_active_pokemon
     if us is None or them is None:
@@ -110,7 +124,7 @@ def _opp_can_kill_now_heuristic(b: AbstractBattle) -> bool:
     off_boost = (them.boosts.get("atk", 0) or 0) > 0 or (them.boosts.get("spa", 0) or 0) > 0
     se_stab_potential = False
     if us.types and them.types:
-        class _T:  # fake move to reuse damage_multiplier
+        class _T:
             def __init__(self, t): self.type = t
         try:
             for t in them.types:
@@ -119,10 +133,16 @@ def _opp_can_kill_now_heuristic(b: AbstractBattle) -> bool:
                     break
         except Exception:
             pass
-    if us_hp < 0.5 and off_boost: return True
-    if us_hp < 0.6 and se_stab_potential: return True
+    if us_hp < 0.5 and off_boost:
+        return True
+    if us_hp < 0.6 and se_stab_potential:
+        return True
     return False
 
+
+# ----------------------------
+# Environment
+# ----------------------------
 class ShowdownEnvironment(BaseShowdownEnv):
 
     def __init__(
@@ -139,36 +159,58 @@ class ShowdownEnvironment(BaseShowdownEnv):
             team=team,
         )
 
+        # The RL agent is the first account in this head-to-head wrapper
         self.rl_agent = account_name_one
 
-        self._act_counts = {"attack": 0, "switch": 0}  # track chosen actions
-        self._teacher_hits = 0  # steps where agent == teacher
-        self._teacher_total = 0  # total steps with a teacher label
+        # Diagnostics / teacher-imitation counters
+        self._act_counts = {"attack": 0, "switch": 0}
+        self._teacher_hits = 0
+        self._teacher_total = 0
         self.last_action_binary: Optional[int] = None  # 0=attack, 1=switch
-        self.debug_actions = False  # set True to print mapping each step
+        self.debug_actions = False
 
+        # Diagnostics to prove process_action is being invoked
+        self._process_action_seen = False
+        self._process_action_calls = 0
+
+    # 2 actions: 0 = best move, 1 = best switch
     def _get_action_size(self) -> int | None:
-        # 0 = best move, 1 = best switch
         return 2
 
     def process_action(self, action: np.int64) -> np.int64:
-        a = int(action)
+        """
+        Map 2-action policy to battle order ids.
+        0 -> best attack (move index -> order 6..9)
+        1 -> best switch (switch index -> order 0..5)
+        """
         b: AbstractBattle = self.battle1
-        if b is None:
+
+        # Guard: don’t act if the battle is already finished
+        if b is None or getattr(b, "finished", False):
+            self.last_action_binary = None
             return np.int64(-2)
 
-        # forced switch: ignore "attack"
+        # Mark hook usage
+        self._process_action_seen = True
+        self._process_action_calls += 1
+
+        a = int(action)
+
+        # Forced switch: ignore requested "attack"
         if b.force_switch:
             self.last_action_binary = 1
             j = _best_switch_idx(b)
             if j is not None:
                 self._act_counts["switch"] += 1
-            out = np.int64(j if j is not None else -2)
+                out = np.int64(j)
+            else:
+                out = np.int64(-2)
             if self.debug_actions:
                 print(f"[ACTIONS] forced switch -> order_id={int(out)}")
             return out
 
-        if a == 0:  # attack
+        # Attack (a == 0)
+        if a == 0:
             self.last_action_binary = 0
             self._act_counts["attack"] += 1
             i = _best_move_idx(b)
@@ -177,7 +219,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 print(f"[ACTIONS] a=attack i={i} -> order_id={int(out)}")
             return out
 
-        # a == 1: switch
+        # Switch (a == 1)
         self.last_action_binary = 1
         self._act_counts["switch"] += 1
         j = _best_switch_idx(b)
@@ -187,7 +229,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 print(f"[ACTIONS] a=switch j={j} -> order_id={int(out)}")
             return out
 
-        # fallback to attack if no switches
+        # No switches available → fallback to best attack
         i = _best_move_idx(b)
         out = np.int64(6 + (i or 0)) if i is not None else np.int64(-2)
         if self.debug_actions:
@@ -196,23 +238,34 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
+
         if self.battle1 is not None:
             agent = self.possible_agents[0]
             info[agent]["win"] = self.battle1.won
             info[agent]["action_counts"] = dict(self._act_counts)
+            info[agent]["action_counts_str"] = f"A:{self._act_counts['attack']} S:{self._act_counts['switch']}"
             info[agent]["teacher_match_rate"] = (
                 self._teacher_hits / self._teacher_total if self._teacher_total else 0.0
             )
-            # Optional: when a battle ends, reset counters for the next episode
+            # Diagnostics to confirm mapping is being used
+            info[agent]["process_action_seen"] = self._process_action_seen
+            info[agent]["process_action_calls"] = self._process_action_calls
+
+            # When a battle ends, reset counters for next episode
             if self.battle1.finished:
                 self._act_counts = {"attack": 0, "switch": 0}
                 self._teacher_hits = 0
                 self._teacher_total = 0
                 self.last_action_binary = None
+                self._process_action_seen = False
+                self._process_action_calls = 0
 
         return info
 
     def calc_reward(self, battle: AbstractBattle) -> float:
+        """
+        Reward = small imitation tick + lightweight damage shaping + terminal win/loss.
+        """
         us, them = battle.active_pokemon, battle.opponent_active_pokemon
         i = _best_move_idx(battle)
         j = _best_switch_idx(battle)
@@ -226,31 +279,35 @@ class ShowdownEnvironment(BaseShowdownEnv):
             switch_score = _estimate_matchup(list(battle.available_switches)[j], opp) if opp else 0.0
 
         teacher_attack = move_score >= switch_score
-        # assume your agent’s last chosen mapped action stored by base env:
-        # if not available, this still works as a per-step classifier;
-        # most wrappers can expose last action—if not, you can skip and rely on terminal shaping
-        a_last = getattr(self, "last_action_binary",
-                         None)  # 0 attack, 1 switch; set this right after process_action returns
-        imitation = 1.0 if (a_last is not None and ((a_last == 0) == teacher_attack)) else 0.0
-        self._teacher_total += 1
-        if imitation > 0.0:
-            self._teacher_hits += 1
 
-        r = 0.5 * imitation  # small imitation tick
-        # tiny shaping so it still cares about outcome
+        # Imitation tick only if we actually chose an action this step
+        a_last = getattr(self, "last_action_binary", None)  # 0 attack, 1 switch
+        imitation = 1.0 if (a_last is not None and ((a_last == 0) == teacher_attack)) else 0.0
+        if a_last is not None:
+            self._teacher_total += 1
+            if imitation > 0.0:
+                self._teacher_hits += 1
+
+        r = 0.5 * imitation
+
+        # Lightweight damage shaping using prior battle snapshot
         prior = self._get_prior_battle(battle)
         if prior is not None:
             def hp_vec(side):
                 v = [float(m.current_hp_fraction) for m in side.values()]
-                while len(v) < 6: v.append(1.0)
+                while len(v) < 6:
+                    v.append(1.0)
                 return v
 
             dealt = float(np.sum(np.array(hp_vec(prior.opponent_team)) - np.array(hp_vec(battle.opponent_team))))
             taken = float(np.sum(np.array(hp_vec(prior.team)) - np.array(hp_vec(battle.team))))
             r += dealt - 0.5 * taken
 
-        if battle.won:  r += 20.0
-        if battle.lost: r -= 20.0
+        if battle.won:
+            r += 20.0
+        if battle.lost:
+            r -= 20.0
+
         return float(r)
 
     def _observation_size(self) -> int:
@@ -276,12 +333,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         else:
             switch_score = 0.0
 
-        # simple normalization to ~[0,1..few]
+        # simple normalization
         def nz(x, scale):
             return float(x) / float(scale)
 
-        move_n = nz(move_score, 200.0)  # 200 ≈ big STAB BP hit baseline
-        switch_n = nz(switch_score, 2.0)  # matchup is small magnitude
+        move_n = nz(move_score, 200.0)   # ~big STAB BP baseline
+        switch_n = nz(switch_score, 2.0) # matchup diff is small magnitude
 
         speed_edge = 1.0 if _speed_advantage(us, them) else 0.0
         can_kill = 1.0 if _can_kill_now(battle, i_best) else 0.0
@@ -291,8 +348,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         my_hp = _hp_frac(us)
         opp_hp = _hp_frac(them)
         my_alive = (sum(1 for p in (battle.team or {}).values() if not p.fainted) / 6.0) if battle.team else 1.0
-        opp_alive = (sum(
-            1 for p in (battle.opponent_team or {}).values() if not p.fainted) / 6.0) if battle.opponent_team else 1.0
+        opp_alive = (sum(1 for p in (battle.opponent_team or {}).values() if not p.fainted) / 6.0) if battle.opponent_team else 1.0
 
         obs = np.array(
             [move_n, switch_n, speed_edge, can_kill, opp_can_kill,
@@ -302,29 +358,14 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return obs
 
 
-
 ########################################
 # DO NOT EDIT THE CODE BELOW THIS LINE #
 ########################################
 
-
 class SingleShowdownWrapper(SingleAgentWrapper):
     """
-    A wrapper class for the PokeEnvironment that simplifies the setup of single-agent
-    reinforcement learning tasks in a Pokémon battle environment.
-
-    This class initializes the environment with a specified battle format, opponent type,
-    and evaluation mode. It also handles the creation of opponent players and account names
-    for the environment.
-
-    Do NOT edit this class!
-
-    Attributes:
-        battle_format (str): The format of the Pokémon battle (e.g., "gen9randombattle").
-        opponent_type (str): The type of opponent player to use ("simple", "max", "random").
-        evaluation (bool): Whether the environment is in evaluation mode.
-    Raises:
-        ValueError: If an unknown opponent type is provided.
+    Simplifies setup of single-agent RL tasks for Pokémon battles.
+    Do NOT edit this class.
     """
 
     def __init__(
